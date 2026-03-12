@@ -37,7 +37,22 @@ def compute_jaccard(mask_a: torch.Tensor, mask_b: torch.Tensor) -> float:
     """Jaccard overlap between two boolean neuron masks.
 
     J(A, B) = |A ∩ B| / |A ∪ B|
+
+    Handles dimension mismatches after neurogenesis by padding the shorter
+    mask with ``False`` (new neurons not present in the older mask are treated
+    as not belonging to that engram).
     """
+    a_len, b_len = len(mask_a), len(mask_b)
+    if a_len != b_len:
+        max_len = max(a_len, b_len)
+        if a_len < max_len:
+            padded = torch.zeros(max_len, dtype=torch.bool, device=mask_a.device)
+            padded[:a_len] = mask_a
+            mask_a = padded
+        if b_len < max_len:
+            padded = torch.zeros(max_len, dtype=torch.bool, device=mask_b.device)
+            padded[:b_len] = mask_b
+            mask_b = padded
     intersection = (mask_a & mask_b).sum().item()
     union = (mask_a | mask_b).sum().item()
     if union == 0:

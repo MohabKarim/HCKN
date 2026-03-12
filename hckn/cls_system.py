@@ -146,7 +146,20 @@ class EWCRegularizer:
                     continue
                 f = fisher[name].to(device)
                 theta_star = optima[name].to(device)
-                loss = loss + (f * (param - theta_star).pow(2)).sum()
+                if param.shape != f.shape:
+                    # Neurogenesis grew the parameter — penalise only the old portion
+                    if param.dim() == 1:
+                        old_dim = f.shape[0]
+                        loss = loss + (f * (param[:old_dim] - theta_star).pow(2)).sum()
+                    elif param.dim() == 2:
+                        old_rows = min(f.shape[0], param.shape[0])
+                        old_cols = min(f.shape[1], param.shape[1])
+                        loss = loss + (
+                            f[:old_rows, :old_cols]
+                            * (param[:old_rows, :old_cols] - theta_star[:old_rows, :old_cols]).pow(2)
+                        ).sum()
+                else:
+                    loss = loss + (f * (param - theta_star).pow(2)).sum()
 
         return (self.ewc_lambda / 2.0) * loss
 
