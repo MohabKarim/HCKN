@@ -191,8 +191,35 @@ class HippocampalReplayBuffer:
         labels = torch.tensor([self._labels[i] for i in indices],
                                dtype=torch.long, device=self.device)
         task_ids = [self._task_ids[i] for i in indices]
-        logits = torch.stack([self._logits[i] for i in indices]).to(self.device)
-        features = torch.stack([self._features[i] for i in indices]).to(self.device)
+
+        # After neurogenesis the backbone output dimension grows (e.g. 128→192).
+        # Features stored before neurogenesis are shorter than those stored
+        # after it.  Pad all feature vectors to the maximum dimension in this
+        # sampled batch with zeros so that torch.stack() succeeds.
+        feat_tensors = [self._features[i] for i in indices]
+        max_feat_dim = max(f.shape[0] for f in feat_tensors)
+        if any(f.shape[0] < max_feat_dim for f in feat_tensors):
+            padded = []
+            for f in feat_tensors:
+                if f.shape[0] < max_feat_dim:
+                    pad = torch.zeros(max_feat_dim - f.shape[0], dtype=f.dtype, device=f.device)
+                    f = torch.cat([f, pad])
+                padded.append(f)
+            feat_tensors = padded
+        features = torch.stack(feat_tensors).to(self.device)
+
+        # Logit vectors can also differ if the output head changed; pad similarly.
+        logit_tensors = [self._logits[i] for i in indices]
+        max_logit_dim = max(l.shape[0] for l in logit_tensors)
+        if any(l.shape[0] < max_logit_dim for l in logit_tensors):
+            padded_logits = []
+            for l in logit_tensors:
+                if l.shape[0] < max_logit_dim:
+                    pad = torch.zeros(max_logit_dim - l.shape[0], dtype=l.dtype, device=l.device)
+                    l = torch.cat([l, pad])
+                padded_logits.append(l)
+            logit_tensors = padded_logits
+        logits = torch.stack(logit_tensors).to(self.device)
 
         return inputs, labels, task_ids, logits, features
 
