@@ -70,6 +70,21 @@ class HCKNConfig:
     batch_size: int = 64
 
     # ------------------------------------------------------------------ #
+    # v6 Mechanism 1 — Hippocampal Replay (Sharp-Wave Ripples / DER++)
+    # ------------------------------------------------------------------ #
+    replay_buffer_size: int = 2000    # total samples across all tasks
+    replay_batch_size: int = 32       # replay samples per training batch
+    replay_alpha: float = 1.0         # replay classification loss weight
+    replay_beta: float = 0.5          # logit distillation loss weight
+    replay_gamma: float = 1.0         # feature distillation loss weight
+
+    # ------------------------------------------------------------------ #
+    # v6 Mechanism 3 — Perineuronal Nets (Progressive Layer Freezing)
+    # ------------------------------------------------------------------ #
+    progressive_freeze: bool = True   # enable progressive layer freezing
+    freeze_schedule: str = "linear"   # "linear" or "step"
+
+    # ------------------------------------------------------------------ #
     # Device
     # ------------------------------------------------------------------ #
     device: str = "auto"   # "auto" → detect CUDA/MPS/CPU at runtime

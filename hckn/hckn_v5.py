@@ -30,6 +30,7 @@ from .router import CA3Router
 from .separation import OverlapAwareAllocator
 from .cls_system import EWCRegularizer, TwoPhaseTrainer, TransferMetrics
 from .metrics import AccuracyMatrix, memory_efficiency_report, print_results_table
+from .replay import HippocampalReplayBuffer
 
 
 def _resolve_device(device_str: str) -> torch.device:
@@ -97,6 +98,14 @@ class HCKNv5:
         )
         self.ewc = EWCRegularizer(ewc_lambda=config.ewc_lambda)
 
+        # v6: Hippocampal Replay Buffer (Mechanism 1 — Sharp-Wave Ripples)
+        self.replay_buffer: Optional[HippocampalReplayBuffer] = None
+        if config.replay_buffer_size > 0:
+            self.replay_buffer = HippocampalReplayBuffer(
+                buffer_size=config.replay_buffer_size,
+                device=self.device,
+            )
+
         # Tracking
         self.acc_matrix: Optional[AccuracyMatrix] = None
         self.transfer_metrics: Optional[TransferMetrics] = None
@@ -139,15 +148,35 @@ class HCKNv5:
         )
 
         # -------------------------------------------------------------- #
-        # Phase 1 + 2: Two-Phase Training
+        # Mechanism 3: Perineuronal Nets — Progressive Layer Freezing
+        # Freeze early layers proportional to how many tasks we have seen.
+        # The backbone is fully plastic for the *first* task.
         # -------------------------------------------------------------- #
+        if self.cfg.progressive_freeze and task_id > 0:
+            total_linear = len(self.model.backbone.get_linear_layers())
+            if self.cfg.freeze_schedule == "step":
+                # Step schedule: freeze one additional layer every
+                # (num_tasks // total_linear) tasks.
+                step = max(1, self.cfg.num_tasks // total_linear)
+                layers_to_freeze = min(total_linear - 1, task_id // step)
+            else:
+                # Linear schedule (default): proportional to task progress.
+                layers_to_freeze = min(
+                    total_linear - 1,
+                    task_id * total_linear // self.cfg.num_tasks,
+                )
+            self.model.backbone.freeze_early_layers(layers_to_freeze)
+
+        # -------------------------------------------------------------- #
+        # Phase 1 + 2: Two-Phase Training
         # NOTE: engram mask is not yet available for phase 2 at this point.
         # We do exploration first, then form the engram, then run a
         # short crystallisation pass.
+        # -------------------------------------------------------------- #
         n_explore = max(1, int(self.cfg.num_epochs * self.cfg.phase_split))
         n_crystal = max(0, self.cfg.num_epochs - n_explore)
 
-        # Exploration (no engram gating)
+        # Exploration (no engram gating, with replay if buffer available)
         explore_trainer = TwoPhaseTrainer(
             model=self.model,
             task_id=task_id,
@@ -159,6 +188,11 @@ class HCKNv5:
             backbone_lr_ratio=self.cfg.backbone_lr_ratio,
             ewc_regularizer=self.ewc if task_id > 0 else None,
             engram_mask=None,
+            replay_buffer=self.replay_buffer if task_id > 0 else None,
+            replay_batch_size=self.cfg.replay_batch_size,
+            replay_alpha=self.cfg.replay_alpha,
+            replay_beta=self.cfg.replay_beta,
+            replay_gamma=self.cfg.replay_gamma,
         )
         p1_losses = explore_trainer.exploration_phase(n_explore)
 
@@ -180,6 +214,13 @@ class HCKNv5:
             self.model, task_id, train_loader, self.device,
             pre_allocated_mask=engram_mask,
         )
+
+        # -------------------------------------------------------------- #
+        # Mechanism 3 (Crystallisation): unfreeze backbone for crystal phase
+        # then re-freeze during crystallisation as PNNs wrap the engram.
+        # -------------------------------------------------------------- #
+        if self.cfg.progressive_freeze and task_id > 0:
+            self.model.backbone.unfreeze_all()
 
         # -------------------------------------------------------------- #
         # Crystallisation (with engram gating)
@@ -208,6 +249,22 @@ class HCKNv5:
         proto_loader = val_loader if val_loader is not None else train_loader
         features_list = self._collect_features(proto_loader)
         self.router.store_prototype(task_id, features_list)
+
+        # -------------------------------------------------------------- #
+        # Mechanism 1: Populate replay buffer with current task samples
+        # (with current logits + features as dark knowledge)
+        # -------------------------------------------------------------- #
+        if self.replay_buffer is not None:
+            self._populate_replay_buffer(task_id, train_loader)
+
+        # -------------------------------------------------------------- #
+        # Mechanism 2: Memory Reconsolidation — re-align all prototypes
+        # with the current (possibly drifted) backbone.
+        # -------------------------------------------------------------- #
+        if self.replay_buffer is not None and self.replay_buffer.size > 0:
+            self.router.reconsolidate_all(
+                self.replay_buffer, self.model, self.device
+            )
 
         # -------------------------------------------------------------- #
         # Update Fisher information for EWC
@@ -347,3 +404,35 @@ class HCKNv5:
             inputs = inputs.to(self.device)
             feats.append(self.model.forward_features(inputs).cpu())
         return torch.cat(feats, dim=0)
+
+    @torch.no_grad()
+    def _populate_replay_buffer(
+        self, task_id: int, dataloader: DataLoader
+    ) -> None:
+        """Store a sample of current-task data into the replay buffer.
+
+        For each batch we run a full forward pass to capture the soft
+        logits and feature vectors at the time of storage (dark knowledge).
+        These are used later for logit- and feature-distillation losses.
+
+        Neuroscience analogy
+        --------------------
+        At the end of a learning episode, the hippocampus ''tags'' a subset
+        of the experienced events for sharp-wave-ripple replay during the
+        next sleep period.  We tag by storing representative examples with
+        their current neural activations (logits + features).
+        """
+        self.model.eval()
+        for inputs, labels in dataloader:
+            inputs = inputs.to(self.device)
+            labels = labels.to(self.device)
+            features = self.model.backbone(inputs)
+            logits = self.model.heads[task_id](features)
+            self.replay_buffer.update_buffer(
+                inputs=inputs,
+                labels=labels,
+                task_id=task_id,
+                logits=logits,
+                features=features,
+            )
+        self.model.train()
