@@ -176,12 +176,37 @@ class CA3Router:
         return pred_tasks, confidences
 
     def _distance(self, feat: np.ndarray, task_id: int) -> float:
-        """Compute distance from *feat* to the centroid of *task_id*."""
+        """Compute distance from *feat* to the centroid of *task_id*.
+
+        Handles dimension mismatches that arise after neurogenesis: if the
+        backbone was grown after a prototype was stored, the stored centroid
+        will have fewer dimensions than *feat*.  The centroid is zero-padded
+        to match *feat*'s length (new neurons contribute zero to the stored
+        prototype).  If the centroid is somehow larger than *feat*, it is
+        truncated instead.
+        """
         centroid = self._centroids[task_id]
+        feat_dim = feat.shape[0]
+        cent_dim = centroid.shape[0]
+        if feat_dim > cent_dim:
+            padded = np.zeros(feat_dim, dtype=centroid.dtype)
+            padded[:cent_dim] = centroid
+            centroid = padded
+        elif cent_dim > feat_dim:
+            centroid = centroid[:feat_dim]
+
         diff = feat - centroid
         if self.distance_metric == "mahalanobis":
             inv_cov = self._inv_covs.get(task_id)
             if inv_cov is not None:
+                old_d = inv_cov.shape[0]
+                if feat_dim > old_d:
+                    # Extend with identity block for new dimensions
+                    padded_cov = np.eye(feat_dim, dtype=inv_cov.dtype)
+                    padded_cov[:old_d, :old_d] = inv_cov
+                    inv_cov = padded_cov
+                elif feat_dim < old_d:
+                    inv_cov = inv_cov[:feat_dim, :feat_dim]
                 return float(np.sqrt(np.maximum(diff @ inv_cov @ diff, 0.0)))
         # Euclidean fallback
         return float(np.sqrt(np.dot(diff, diff)))
