@@ -57,6 +57,48 @@ class HCKNBackbone(nn.Module):
         """Return all Linear sub-modules in order."""
         return [m for m in self.layers if isinstance(m, nn.Linear)]
 
+    def freeze_early_layers(self, num_layers_to_freeze: int) -> None:
+        """Freeze the first *num_layers_to_freeze* linear layers (perineuronal nets).
+
+        Once early-layer representations have been consolidated across
+        multiple tasks, wrapping them in ''perineuronal nets'' prevents
+        further synaptic modification — leaving later layers plastic for
+        new learning.
+
+        Neuroscience analogy
+        --------------------
+        Perineuronal nets (PNNs) are extracellular matrix structures that
+        physically surround stabilised neurons, closing the critical period
+        for that cortical layer (Sorg et al., J Neurosci 2016).  Early
+        sensory cortex closes first; higher association areas remain plastic
+        longer.  This creates a stability-plasticity hierarchy that is the
+        key to life-long learning.
+
+        Parameters
+        ----------
+        num_layers_to_freeze:
+            Number of linear layers (counting from the input end) to make
+            non-trainable.  Clamped to ``len(linear_layers) - 1`` so at
+            least one layer stays plastic.
+        """
+        linears = self.get_linear_layers()
+        n = min(max(0, num_layers_to_freeze), len(linears) - 1)
+        for layer in linears[:n]:
+            layer.requires_grad_(False)
+
+    def unfreeze_all(self) -> None:
+        """Unfreeze all layers (re-open plasticity for exploration phase).
+
+        Neuroscience analogy
+        --------------------
+        Memory reconsolidation transiently de-stabilises synapses, making
+        them labile again before re-locking.  Similarly, we temporarily
+        remove the PNN-equivalent freezing at the start of exploration so
+        the backbone can adapt to the new task.
+        """
+        for param in self.parameters():
+            param.requires_grad_(True)
+
     def expand_last_layer(self, num_new_neurons: int) -> None:
         """Grow the last hidden layer by *num_new_neurons* (neurogenesis).
 

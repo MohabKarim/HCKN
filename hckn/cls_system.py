@@ -251,6 +251,17 @@ class TwoPhaseTrainer:
         Optional EWC regulariser; penalty is added during both phases.
     engram_mask / bias_shifts / inhibition_factor:
         Engram parameters applied during Phase 2 gating.
+    replay_buffer:
+        Optional ``HippocampalReplayBuffer``; if provided, a replay batch
+        is mixed into every exploration-phase step (DER++ / SWR analogy).
+    replay_batch_size:
+        Number of replay samples per training step.
+    replay_alpha:
+        Weight on the replay cross-entropy classification loss.
+    replay_beta:
+        Weight on the logit-distillation MSE loss (dark knowledge).
+    replay_gamma:
+        Weight on the feature-distillation MSE loss (synaptic stability).
 
     Neuroscience analogy
     --------------------
@@ -275,6 +286,11 @@ class TwoPhaseTrainer:
         engram_mask: Optional[torch.Tensor] = None,
         bias_shifts: Optional[torch.Tensor] = None,
         inhibition_factor: float = 0.3,
+        replay_buffer=None,
+        replay_batch_size: int = 32,
+        replay_alpha: float = 1.0,
+        replay_beta: float = 0.5,
+        replay_gamma: float = 1.0,
     ) -> None:
         self.model = model
         self.task_id = task_id
@@ -286,6 +302,11 @@ class TwoPhaseTrainer:
         self.engram_mask = engram_mask
         self.bias_shifts = bias_shifts
         self.inhibition_factor = inhibition_factor
+        self.replay_buffer = replay_buffer
+        self.replay_batch_size = replay_batch_size
+        self.replay_alpha = replay_alpha
+        self.replay_beta = replay_beta
+        self.replay_gamma = replay_gamma
 
         self.cls = CLSDualSystem(
             model, task_id,
@@ -294,6 +315,7 @@ class TwoPhaseTrainer:
             weight_decay=weight_decay,
         )
         self.criterion = nn.CrossEntropyLoss()
+        self.mse = nn.MSELoss()
 
     def train(self) -> Dict[str, List[float]]:
         """Run both training phases and return loss history.
@@ -312,10 +334,27 @@ class TwoPhaseTrainer:
         return {"phase1_losses": phase1_losses, "phase2_losses": phase2_losses}
 
     def exploration_phase(self, num_epochs: int) -> List[float]:
-        """Phase 1 — train without engram inhibition.
+        """Phase 1 — train without engram inhibition, with optional replay.
 
         The backbone is free to learn from new data.  EWC penalty prevents
-        catastrophic drift from previously important parameters.
+        catastrophic drift from previously important parameters.  When a
+        replay buffer is provided, each training step additionally:
+
+        1. Draws a replay batch of past experiences.
+        2. Computes ``α · CrossEntropy(replay_batch, stored_labels)`` to
+           reinforce old-task classification (replay CE loss).
+        3. Computes ``β · MSE(current_logits, stored_logits)`` to keep the
+           decision boundary consistent (dark-knowledge distillation).
+        4. Computes ``γ · MSE(current_features, stored_features)`` to prevent
+           backbone drift for old-task inputs (feature / synaptic distillation).
+
+        Neuroscience analogy
+        --------------------
+        Sharp-wave ripples during awake periods and slow-wave sleep replay
+        ~50% old content.  The simultaneous CE + logit + feature losses
+        capture: (a) re-practising old behaviour, (b) preserving *how*
+        old stimuli were categorised, and (c) preserving the neocortical
+        representation of old inputs.
         """
         losses: List[float] = []
         self.model.train()
@@ -327,12 +366,94 @@ class TwoPhaseTrainer:
             for inputs, labels in self.dataloader:
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
                 opt.zero_grad()
-                # No engram gating in exploration phase
+
+                # Current-task forward
                 features = self.model.backbone(inputs)
                 logits = self.model.heads[self.task_id](features)
                 loss = self.criterion(logits, labels)
+
+                # EWC penalty
                 if self.ewc is not None:
                     loss = loss + self.ewc.penalty(self.model)
+
+                # -------------------------------------------------------- #
+                # Hippocampal Replay (Sharp-Wave Ripple analogy)
+                # -------------------------------------------------------- #
+                if self.replay_buffer is not None and self.replay_buffer.size > 0:
+                    replay = self.replay_buffer.sample_replay_batch(
+                        self.replay_batch_size
+                    )
+                    if replay is not None:
+                        (
+                            r_inputs,
+                            r_labels,
+                            r_task_ids,
+                            r_stored_logits,
+                            r_stored_features,
+                        ) = replay
+
+                        # Current backbone features on replay inputs
+                        r_cur_features = self.model.backbone(r_inputs)
+
+                        # Replay classification loss (α): re-practice old tasks
+                        # We route each replay sample through its own head.
+                        # Group by task_id for efficiency.
+                        unique_tids = sorted(set(r_task_ids))
+                        # Pre-compute per-task boolean masks (reused across losses)
+                        tid_masks = {
+                            tid: torch.tensor(
+                                [t == tid for t in r_task_ids],
+                                dtype=torch.bool,
+                                device=self.device,
+                            )
+                            for tid in unique_tids
+                            if tid < len(self.model.heads)
+                        }
+                        valid_tids = list(tid_masks.keys())
+
+                        # Replay classification loss (α): re-practice old tasks
+                        replay_ce_loss = torch.tensor(0.0, device=self.device)
+                        per_tid_cur_logits: dict = {}
+                        for tid, mask in tid_masks.items():
+                            t_logits = self.model.heads[tid](r_cur_features[mask])
+                            per_tid_cur_logits[tid] = t_logits
+                            replay_ce_loss = replay_ce_loss + self.criterion(
+                                t_logits, r_labels[mask]
+                            )
+                        if valid_tids:
+                            replay_ce_loss = replay_ce_loss / len(valid_tids)
+
+                        loss = loss + self.replay_alpha * replay_ce_loss
+
+                        # Logit distillation loss (β): preserve decision boundary
+                        # Reuse pre-computed per_tid_cur_logits and tid_masks.
+                        if valid_tids:
+                            cur_logits_flat = torch.cat(
+                                [per_tid_cur_logits[tid] for tid in valid_tids], dim=0
+                            )
+                            stored_logits_ordered = torch.cat(
+                                [r_stored_logits[tid_masks[tid]] for tid in valid_tids],
+                                dim=0,
+                            )
+                            min_c = min(
+                                cur_logits_flat.shape[-1],
+                                stored_logits_ordered.shape[-1],
+                            )
+                            loss = loss + self.replay_beta * self.mse(
+                                cur_logits_flat[..., :min_c],
+                                stored_logits_ordered[..., :min_c],
+                            )
+
+                        # Feature distillation loss (γ): synaptic stability
+                        # Constrain backbone not to drift for old inputs.
+                        cur_feat_dim = r_cur_features.shape[-1]
+                        stored_feat_dim = r_stored_features.shape[-1]
+                        overlap_dim = min(cur_feat_dim, stored_feat_dim)
+                        loss = loss + self.replay_gamma * self.mse(
+                            r_cur_features[..., :overlap_dim],
+                            r_stored_features[..., :overlap_dim],
+                        )
+
                 loss.backward()
                 opt.step()
                 epoch_loss += loss.item()

@@ -235,6 +235,89 @@ class CA3Router:
         self._total = 0
 
     # ------------------------------------------------------------------ #
+    # Prototype Reconsolidation  (v6 — Mechanism 2)
+    # ------------------------------------------------------------------ #
+
+    def reconsolidate_all(
+        self,
+        replay_buffer: "HippocampalReplayBuffer",  # noqa: F821
+        model: "torch.nn.Module",
+        device: "torch.device",
+    ) -> None:
+        """Re-align ALL stored prototypes with the current backbone.
+
+        After training each task, the backbone drifts in feature space.
+        Prototypes stored for earlier tasks now point to regions that no
+        longer correspond to those tasks.  This method re-forwards all
+        buffered samples through the *current* backbone and recomputes each
+        task's centroid and inverse covariance.
+
+        Neuroscience analogy
+        --------------------
+        **Memory reconsolidation** (Nader et al., Nature 2000): when an old
+        memory is retrieved it temporarily becomes labile and is updated with
+        current context before being re-stored.  Each time we reconsolidate
+        prototypes we ''re-open'' old memories, refresh them in the current
+        neural context, and ''re-lock'' them — preventing prototype staleness
+        as the backbone evolves.
+
+        Parameters
+        ----------
+        replay_buffer:
+            The ``HippocampalReplayBuffer`` containing past experiences.
+        model:
+            Current model with the (possibly drifted) backbone.
+        device:
+            Compute device.
+        """
+        if replay_buffer.size == 0:
+            return
+
+        import torch
+
+        # Collect features grouped by task_id from the replay buffer
+        task_features: Dict[int, List[np.ndarray]] = {}
+        model.eval()
+        with torch.no_grad():
+            # Process buffer in small chunks to avoid OOM
+            chunk_size = 256
+            n = replay_buffer.size
+            for start in range(0, n, chunk_size):
+                end = min(start + chunk_size, n)
+                indices = list(range(start, end))
+                inp_batch = torch.stack(
+                    [replay_buffer._inputs[i] for i in indices]
+                ).to(device)
+                tids = [replay_buffer._task_ids[i] for i in indices]
+                feats = model.backbone(inp_batch).detach().cpu().numpy().astype(np.float64)
+                for j, tid in enumerate(tids):
+                    if tid not in task_features:
+                        task_features[tid] = []
+                    task_features[tid].append(feats[j])
+
+        # Recompute prototypes for every task that appears in the buffer
+        for tid, feat_list in task_features.items():
+            feats_np = np.stack(feat_list, axis=0)
+            self._centroids[tid] = feats_np.mean(axis=0)
+            if self.distance_metric == "mahalanobis":
+                self._inv_covs[tid] = self._compute_inv_cov(feats_np)
+
+    def reconsolidate_single(self, task_id: int, features: "torch.Tensor") -> None:
+        """Update the prototype for a single task using newly computed features.
+
+        Parameters
+        ----------
+        task_id:
+            Task whose prototype should be updated.
+        features:
+            Feature matrix ``[N, D]`` from the current backbone pass.
+        """
+        feats_np = features.detach().cpu().numpy().astype(np.float64)
+        self._centroids[task_id] = feats_np.mean(axis=0)
+        if self.distance_metric == "mahalanobis":
+            self._inv_covs[task_id] = self._compute_inv_cov(feats_np)
+
+    # ------------------------------------------------------------------ #
     # Misc
     # ------------------------------------------------------------------ #
 

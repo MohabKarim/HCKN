@@ -28,6 +28,7 @@ from .router import CA3Router
 from .separation import OverlapAwareAllocator, compute_overlap_matrix, should_trigger_neurogenesis
 from .cls_system import EWCRegularizer, CLSDualSystem, TwoPhaseTrainer, TransferMetrics
 from .metrics import AccuracyMatrix, memory_efficiency_report, print_results_table
+from .replay import HippocampalReplayBuffer
 from .hckn_v5 import HCKNv5
 
 __all__ = [
@@ -47,6 +48,7 @@ __all__ = [
     "AccuracyMatrix",
     "memory_efficiency_report",
     "print_results_table",
+    "HippocampalReplayBuffer",
     "HCKNv5",
 ]
 
