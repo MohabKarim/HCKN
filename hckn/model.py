@@ -182,12 +182,28 @@ class HCKNModel(nn.Module):
         features = self.backbone(x)
 
         if engram_mask is not None:
+            feat_dim = features.shape[1]
+            mask_dim = engram_mask.shape[0]
+            if feat_dim > mask_dim:
+                # Backbone grew after this engram was stored — pad with False
+                padded_mask = torch.zeros(feat_dim, dtype=torch.bool,
+                                          device=features.device)
+                padded_mask[:mask_dim] = engram_mask.to(features.device)
+                engram_mask = padded_mask
+            elif mask_dim > feat_dim:
+                engram_mask = engram_mask[:feat_dim]
+
             # Inhibit non-engram neurons
             gated = features.clone()
             gated[:, ~engram_mask] *= inhibition_factor
             # Boost engram neurons
             if bias_shifts is not None:
-                gated[:, engram_mask] += bias_shifts.unsqueeze(0)
+                engram_indices = engram_mask.nonzero(as_tuple=True)[0]
+                valid = min(len(bias_shifts), len(engram_indices))
+                if valid > 0:
+                    gated[:, engram_indices[:valid]] += (
+                        bias_shifts[:valid].to(features.device).unsqueeze(0)
+                    )
             features = gated
 
         return self.heads[task_id](features)

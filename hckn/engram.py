@@ -157,14 +157,42 @@ class SparseEngramEncoder:
         -------
         torch.Tensor
             Gated feature tensor ``[B, D]``.
+
+        Notes
+        -----
+        After neurogenesis the backbone output dimension ``D`` may exceed the
+        dimension stored in the engram mask.  The mask is zero-padded with
+        ``False`` values so that new neurons (which were not part of the
+        original engram) are treated as non-engram and receive inhibition.
+        If for any reason the mask is larger than ``D``, it is truncated.
         """
         if task_id not in self.engrams:
             raise KeyError(f"No engram stored for task {task_id}")
         engram = self.engrams[task_id]
-        mask = engram.mask
+        mask = engram.mask.to(features.device)
+        feat_dim = features.shape[1]
+        mask_dim = mask.shape[0]
+
+        if feat_dim > mask_dim:
+            # New neurons added by neurogenesis are not part of old engrams
+            padded_mask = torch.zeros(feat_dim, dtype=torch.bool, device=features.device)
+            padded_mask[:mask_dim] = mask
+            mask = padded_mask
+        elif mask_dim > feat_dim:
+            mask = mask[:feat_dim]
+
         gated = features.clone()
         gated[:, ~mask] *= self.inhibition_factor
-        gated[:, mask] += engram.bias_shifts.unsqueeze(0)
+
+        bias = engram.bias_shifts
+        if bias is not None:
+            # Apply bias only to engram neurons within the current dimension
+            engram_indices = mask.nonzero(as_tuple=True)[0]
+            valid_bias_count = min(len(bias), len(engram_indices))
+            if valid_bias_count > 0:
+                gated[:, engram_indices[:valid_bias_count]] += (
+                    bias[:valid_bias_count].to(features.device).unsqueeze(0)
+                )
         return gated
 
     # ------------------------------------------------------------------ #
